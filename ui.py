@@ -1,7 +1,8 @@
-
 import json
+from io import BytesIO
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,14 +16,12 @@ STATUS_CACHE_FILE = Path("device_status_cache.json")
 WARNING_THRESHOLD = pd.Timedelta(hours=1, minutes=30)
 OFFLINE_THRESHOLD = pd.Timedelta(hours=3, minutes=30)
 
-
 LOCAL_TIMEZONE = "Etc/GMT+3"
 REFRESH_RATE_MS = 300000
 PAGE_NAME = "Distance Sensor"
 
-TELEGRAM_BOT_TOKEN = "8712115882:AAFwRwqoML0Y6czEg00mSD9dSrfwc_AoGsc"
-TELEGRAM_CHAT_ID = "1271566578"
-
+TELEGRAM_BOT_TOKEN = "YOUR_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
 DEVICE_TABLE = pd.DataFrame(
     [
@@ -82,19 +81,35 @@ def notify_warning_to_offline(status_table: pd.DataFrame):
         device_name = row["device_name"]
         current_status = row["status"]
 
-        previous_status = cache.get(device_id, {}).get("status")
+        previous_entry = cache.get(device_id, {})
+        previous_status = previous_entry.get("status")
 
         if previous_status == "warning" and current_status == "offline":
             send_telegram_message(f'Device "{device_name}" is offline now')
 
+        current_lat = row.get("last_latitude")
+        current_lon = row.get("last_longitude")
+
+        if pd.isna(current_lat):
+            current_lat = previous_entry.get("latitude")
+
+        if pd.isna(current_lon):
+            current_lon = previous_entry.get("longitude")
+
         cache[device_id] = {
-            "status": current_status
+            "status": current_status,
+            "latitude": current_lat,
+            "longitude": current_lon,
         }
 
     save_status_cache(cache)
 
 
-def load_device_file(file_path: Path) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_device_file_cached(file_path_str: str, file_mtime: float) -> pd.DataFrame:
+    del file_mtime
+
+    file_path = Path(file_path_str)
     rows = []
 
     with file_path.open("r", encoding="utf-8") as f:
@@ -123,11 +138,18 @@ def load_device_file(file_path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
+
     df["timestamp"] = (
         pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
         .dt.tz_convert(LOCAL_TIMEZONE)
-    )   
+    )
+
+    for col in ["latitude", "longitude"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df
+
 
 def get_last_measure(df: pd.DataFrame):
     if df.empty or "timestamp" not in df.columns:
@@ -136,11 +158,7 @@ def get_last_measure(df: pd.DataFrame):
     if "medicao_atual" not in df.columns:
         return None, None
 
-    latest_row = (
-        df.dropna(subset=["timestamp"])
-        .sort_values("timestamp")
-        .tail(1)
-    )
+    latest_row = df.dropna(subset=["timestamp"]).sort_values("timestamp").tail(1)
 
     if latest_row.empty:
         return None, None
@@ -152,57 +170,90 @@ def get_last_measure(df: pd.DataFrame):
 
     return "medicao_atual", value
 
-def get_device_status_table(files):
-    now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
-    status_rows = []
 
-    for file_path in files:
-        df = load_device_file(file_path)
+def get_last_position(df: pd.DataFrame):
+    if df.empty:
+        return None, None
 
-        device_id = file_path.stem
-        device_name = DEVICE_NAME_MAP.get(device_id, "Unknown device")
+    if "latitude" not in df.columns or "longitude" not in df.columns:
+        return None, None
 
-        if df.empty or "timestamp" not in df.columns:
-            last_seen = pd.NaT
+    pos_df = df.dropna(subset=["timestamp", "latitude", "longitude"]).sort_values("timestamp")
+
+    if pos_df.empty:
+        return None, None
+
+    last_row = pos_df.iloc[-1]
+    return float(last_row["latitude"]), float(last_row["longitude"])
+
+
+def build_status_row(file_path_str: str, file_mtime: float, cache: dict, now: pd.Timestamp):
+    file_path = Path(file_path_str)
+    df = load_device_file_cached(file_path_str, file_mtime)
+
+    device_id = file_path.stem
+    device_name = DEVICE_NAME_MAP.get(device_id, "Unknown device")
+    cached_entry = cache.get(device_id, {})
+
+    last_latitude = cached_entry.get("latitude")
+    last_longitude = cached_entry.get("longitude")
+
+    if df.empty or "timestamp" not in df.columns:
+        last_seen = pd.NaT
+        status = "offline"
+        age = pd.NaT
+        last_measure_name = None
+        last_measure_value = None
+    else:
+        last_seen = df["timestamp"].max()
+        last_measure_name, last_measure_value = get_last_measure(df)
+
+        lat, lon = get_last_position(df)
+        if lat is not None and lon is not None:
+            last_latitude = lat
+            last_longitude = lon
+
+        if pd.isna(last_seen):
             status = "offline"
             age = pd.NaT
-            last_measure_name = None
-            last_measure_value = None
         else:
-            last_seen = df["timestamp"].max()
-            last_measure_name, last_measure_value = get_last_measure(df)
+            age = now - last_seen
 
-            if pd.isna(last_seen):
+            if age > OFFLINE_THRESHOLD:
                 status = "offline"
-                age = pd.NaT
+            elif age > WARNING_THRESHOLD:
+                status = "warning"
             else:
-                age = now - last_seen
+                status = "online"
 
-                if age > OFFLINE_THRESHOLD:
-                    status = "offline"
-                elif age > WARNING_THRESHOLD:
-                    status = "warning"
-                else:
-                    status = "online"
+    return {
+        "device_id": device_id,
+        "device_name": device_name,
+        "last_timestamp": last_seen,
+        "age": age,
+        "status": status,
+        "flag": (
+            "🔴 Offline" if status == "offline"
+            else "🟡 Warning" if status == "warning"
+            else "🟢 Online"
+        ),
+        "last_measure_name": last_measure_name,
+        "last_measure_value": last_measure_value,
+        "last_latitude": last_latitude,
+        "last_longitude": last_longitude,
+    }
 
-        status_rows.append(
-            {
-                "device_id": device_id,
-                "device_name": device_name,
-                "last_timestamp": last_seen,
-                "age": age,
-                "status": status,
-                "flag": (
-                    "🔴 Offline" if status == "offline"
-                    else "🟡 Warning" if status == "warning"
-                    else "🟢 Online"
-                ),
-                "last_measure_name": last_measure_name,
-                "last_measure_value": last_measure_value,
-            }
-        )
 
-    return pd.DataFrame(status_rows)
+def get_device_status_table(files):
+    now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    cache = load_status_cache()
+
+    rows = [
+        build_status_row(str(file_path), file_path.stat().st_mtime, cache, now)
+        for file_path in files
+    ]
+    return pd.DataFrame(rows)
+
 
 def format_timedelta(td):
     if pd.isna(td):
@@ -220,13 +271,79 @@ def format_timedelta(td):
     rem_minutes = minutes % 60
     return f"{hours}h {rem_minutes}m ago"
 
-def format_measure(name, value):
-    if name is None or value is None or pd.isna(value):
-        return "No numeric data"
 
-    if isinstance(value, (float, np.floating)):
-        return f"{name}: {value:.2f}"
-    return f"{name}: {value}"
+def get_border_color(status: str) -> str:
+    if status == "offline":
+        return "#ff4b4b"
+    if status == "warning":
+        return "#f1c40f"
+    return "#2ecc71"
+
+
+@st.cache_data(show_spinner=False)
+def build_static_map_png(device_name: str, latitude: float, longitude: float) -> bytes:
+    import contextily as cx
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    x, y = transformer.transform(longitude, latitude)
+
+    pad_x = 1800
+    pad_y = 700
+
+    fig, ax = plt.subplots(figsize=(14, 3.2))
+    ax.set_xlim(x - pad_x, x + pad_x)
+    ax.set_ylim(y - pad_y, y + pad_y)
+
+    cx.add_basemap(
+        ax,
+        source=cx.providers.CartoDB.Positron,
+        attribution=False,
+    )
+
+    ax.scatter(
+        [x],
+        [y],
+        s=220,
+        c="#c0392b",
+        edgecolors="white",
+        linewidths=2,
+        zorder=5,
+    )
+
+    ax.annotate(
+        device_name,
+        (x, y),
+        xytext=(0, 16),
+        textcoords="offset points",
+        ha="center",
+        fontsize=10,
+        bbox=dict(
+            boxstyle="round,pad=0.25",
+            fc="white",
+            ec="#cccccc",
+            alpha=0.95,
+        ),
+        zorder=6,
+    )
+
+    ax.set_axis_off()
+    plt.tight_layout(pad=0)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0, dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_static_device_map(device_name: str, latitude: float, longitude: float):
+    try:
+        image_bytes = build_static_map_png(device_name, latitude, longitude)
+        st.image(image_bytes, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Could not render static map: {e}")
+
 
 def render_device_cards(status_table: pd.DataFrame):
     st.subheader("Device status")
@@ -244,13 +361,7 @@ def render_device_cards(status_table: pd.DataFrame):
         for col, (_, row) in zip(cols, row_df.iterrows()):
             with col:
                 status = row["status"]
-
-                if status == "offline":
-                    border_color = "#ff4b4b"
-                elif status == "warning":
-                    border_color = "#f1c40f"
-                else:
-                    border_color = "#2ecc71"
+                border_color = get_border_color(status)
 
                 last_seen_text = (
                     row["last_timestamp"].strftime("%Y-%m-%d %H:%M:%S")
@@ -274,7 +385,7 @@ def render_device_cards(status_table: pd.DataFrame):
                         border: 2px solid {border_color};
                         border-radius: 6px;
                         padding: 16px;
-                        margin-bottom: 16px;
+                        margin-bottom: 8px;
                         min-height: 220px;
                     ">
                         <div style="font-size: 1.1rem; font-weight: 700; margin-bottom: 10px;">
@@ -290,89 +401,62 @@ def render_device_cards(status_table: pd.DataFrame):
                     unsafe_allow_html=True,
                 )
 
-def main():
-    st.set_page_config(page_title=PAGE_NAME, layout="wide")
+                if st.button(
+                    f"Open {row['device_name']}",
+                    key=f"open_{row['device_id']}",
+                    use_container_width=True,
+                ):
+                    st.session_state["selected_device_id"] = row["device_id"]
+                    st.rerun()
 
-    st_autorefresh(interval=REFRESH_RATE_MS, key="device_dashboard_refresh")
 
-    
-    st.title("IoT Sensor Viewer")
+def render_device_details(selected_device_id: str, files, status_table: pd.DataFrame):
+    selected_file = next((f for f in files if f.stem == selected_device_id), None)
 
-    if not DATA_DIR.exists():
-        st.warning("No data folder found.")
+    if selected_file is None:
+        st.error("Selected device file not found.")
         return
 
-    files = sorted(DATA_DIR.glob("*.jsonl"))
-    if not files:
-        st.warning("No device files found in data/.")
-        return
-
-    status_table = get_device_status_table(files)
-    notify_warning_to_offline(status_table)
-
-    status_table = get_device_status_table(files)
-
-    online_count = int((status_table["status"] == "online").sum())
-    warning_count = int((status_table["status"] == "warning").sum())
-    offline_count = int((status_table["status"] == "offline").sum())
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total devices", len(status_table))
-    c2.metric("Online", online_count)
-    c3.metric("Warning", warning_count)
-    c4.metric("Offline", offline_count)
-
-    render_device_cards(status_table)
-
-    def format_device_option(file_path: Path) -> str:
-        device_id = file_path.stem
-        row = status_table[status_table["device_id"] == device_id]
-
-        device_name = DEVICE_NAME_MAP.get(device_id, "Unknown device")
-
-        if row.empty:
-            icon = "🔴"
-        else:
-            status = row.iloc[0]["status"]
-            if status == "offline":
-                icon = "🔴"
-            elif status == "warning":
-                icon = "🟡"
-            else:
-                icon = "🟢"
-
-        return f"{icon} {device_name}"
-
-    selected_file = st.selectbox(
-        "Select device",
-        files,
-        format_func=format_device_option,
-    )
-
-    df = load_device_file(selected_file)
+    df = load_device_file_cached(str(selected_file), selected_file.stat().st_mtime)
 
     if df.empty:
         st.warning("Selected device file is empty.")
         return
 
-    selected_device_id = selected_file.stem
     selected_status_row = status_table[status_table["device_id"] == selected_device_id]
 
     if selected_status_row.empty:
         selected_device_name = DEVICE_NAME_MAP.get(selected_device_id, "Unknown device")
         selected_flag = "🔴 Offline"
         selected_last_seen = pd.NaT
+        lat, lon = None, None
     else:
         selected_device_name = selected_status_row.iloc[0]["device_name"]
         selected_flag = selected_status_row.iloc[0]["flag"]
         selected_last_seen = selected_status_row.iloc[0]["last_timestamp"]
+        lat = selected_status_row.iloc[0]["last_latitude"]
+        lon = selected_status_row.iloc[0]["last_longitude"]
 
-    st.subheader(f"{selected_flag} {selected_device_name} ({selected_device_id})")
+    top_left, top_right = st.columns([1, 5])
+
+    with top_left:
+        if st.button("← Back", use_container_width=True):
+            st.session_state["selected_device_id"] = None
+            st.rerun()
+
+    with top_right:
+        st.subheader(f"{selected_flag} {selected_device_name} ({selected_device_id})")
 
     if pd.notna(selected_last_seen):
-        st.caption(f"Last timestamp: {selected_last_seen.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        st.caption(f"Last timestamp: {selected_last_seen.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         st.caption("Last timestamp: No data")
+
+    st.subheader("Device location")
+    if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+        st.info("No location data available for this device.")
+    else:
+        render_static_device_map(selected_device_name, lat, lon)
 
     with st.expander("Show reports list", expanded=False):
         st.dataframe(df, width="stretch")
@@ -382,6 +466,8 @@ def main():
         c for c in df.columns
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
     ]
+
+    numeric_columns = [c for c in numeric_columns if c not in {"latitude", "longitude"}]
 
     if not numeric_columns:
         st.info("No numeric sensor fields found in decrypted payload.")
@@ -405,7 +491,7 @@ def main():
     window_size = 5
     if fit_type == "Rolling average":
         window_size = st.slider("Smoothing window", 3, 15, 5)
-    
+
     fig = go.Figure()
 
     fig.add_trace(
@@ -445,13 +531,54 @@ def main():
                 name=f"Rolling avg ({window_size})",
             )
         )
-        fig.update_layout(
-            title=f"{selected_flag} {selected_device_name} ({selected_device_id}) - {sensor_field}",
-            xaxis_title="Timestamp",
-            yaxis_title=sensor_field,
-        )
+
+    fig.update_layout(
+        title=f"{selected_flag} {selected_device_name} ({selected_device_id}) - {sensor_field}",
+        xaxis_title="Timestamp",
+        yaxis_title=sensor_field,
+    )
 
     st.plotly_chart(fig, width="stretch")
+
+
+def main():
+    st.set_page_config(page_title=PAGE_NAME, layout="wide")
+    st_autorefresh(interval=REFRESH_RATE_MS, key="device_dashboard_refresh")
+
+    if "selected_device_id" not in st.session_state:
+        st.session_state["selected_device_id"] = None
+
+    st.title("IoT Sensor Viewer")
+
+    if not DATA_DIR.exists():
+        st.warning("No data folder found.")
+        return
+
+    files = sorted(DATA_DIR.glob("*.jsonl"))
+    if not files:
+        st.warning("No device files found in data/.")
+        return
+
+    status_table = get_device_status_table(files)
+    notify_warning_to_offline(status_table)
+
+    selected_device_id = st.session_state["selected_device_id"]
+
+    if selected_device_id:
+        render_device_details(selected_device_id, files, status_table)
+        return
+
+    online_count = int((status_table["status"] == "online").sum())
+    warning_count = int((status_table["status"] == "warning").sum())
+    offline_count = int((status_table["status"] == "offline").sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total devices", len(status_table))
+    c2.metric("Online", online_count)
+    c3.metric("Warning", warning_count)
+    c4.metric("Offline", offline_count)
+
+    render_device_cards(status_table)
 
 
 if __name__ == "__main__":

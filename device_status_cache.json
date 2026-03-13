@@ -1,38 +1,62 @@
 {
   "0x355025930370331": {
-    "status": "offline"
+    "status": "offline",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370349": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370364": {
-    "status": "online"
+    "status": "offline",
+    "latitude": -22.243833,
+    "longitude": -45.713528
   },
   "0x355025930370380": {
-    "status": "offline"
+    "status": "online",
+    "latitude": 51.5074,
+    "longitude": -0.1278
   },
   "0x355025930370398": {
-    "status": "offline"
+    "status": "offline",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370422": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370430": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370448": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370455": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370463": {
-    "status": "online"
+    "status": "online",
+    "latitude": null,
+    "longitude": null
   },
   "0x355025930370588": {
-    "status": "offline"
+    "status": "offline",
+    "latitude": null,
+    "longitude": null
   },
   "???": {
-    "status": "offline"
+    "status": "offline",
+    "latitude": null,
+    "longitude": null
   }
 }
