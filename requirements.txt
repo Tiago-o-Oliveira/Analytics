@@ -3,3 +3,7 @@ streamlit
 pandas
 plotly
 streamlit-autorefresh
+matplotlib
+numpy
+geopandas
+contextily
