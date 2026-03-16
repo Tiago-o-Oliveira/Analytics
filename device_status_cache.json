@@ -5,7 +5,7 @@
     "longitude": -45.713528
   },
   "0x355025930370349": {
-    "status": "online",
+    "status": "offline",
     "latitude": null,
     "longitude": null
   },
@@ -15,7 +15,7 @@
     "longitude": -45.713528
   },
   "0x355025930370380": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
@@ -25,27 +25,27 @@
     "longitude": -45.713528
   },
   "0x355025930370422": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
   "0x355025930370430": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
   "0x355025930370448": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
   "0x355025930370455": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
   "0x355025930370463": {
-    "status": "online",
+    "status": "offline",
     "latitude": -22.243833,
     "longitude": -45.713528
   },
