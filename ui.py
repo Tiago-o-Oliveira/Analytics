@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import psycopg
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-DATA_DIR = Path("data")
 STATUS_CACHE_FILE = Path("device_status_cache.json")
 
 WARNING_THRESHOLD = pd.Timedelta(hours=1, minutes=30)
@@ -22,6 +22,8 @@ PAGE_NAME = "Distance Sensor"
 
 TELEGRAM_BOT_TOKEN = "YOUR_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+
+DB_DSN = "postgresql://neondb_owner:npg_AnI2CGQF6Ela@ep-divine-tooth-acd11owz-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 DEVICE_TABLE = pd.DataFrame(
     [
@@ -105,39 +107,32 @@ def notify_warning_to_offline(status_table: pd.DataFrame):
     save_status_cache(cache)
 
 
-@st.cache_data(show_spinner=False)
-def load_device_file_cached(file_path_str: str, file_mtime: float) -> pd.DataFrame:
-    del file_mtime
+@st.cache_data(show_spinner=False, ttl=60)
+def load_all_records_cached(_refresh_key: int = 0) -> pd.DataFrame:
+    del _refresh_key
 
-    file_path = Path(file_path_str)
-    rows = []
+    query = """
+        SELECT
+            device_id,
+            topic,
+            timestamp,
+            payload_hex,
+            payload_decrypted
+        FROM mqtt_records
+        ORDER BY timestamp ASC
+    """
 
-    with file_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            item = json.loads(line)
+    with psycopg.connect(DB_DSN) as conn:
+        df = pd.read_sql(query, conn)
 
-            device_id = item.get("device_id")
-
-            row = {
-                "device_id": device_id,
-                "device_name": DEVICE_NAME_MAP.get(device_id, "Unknown device"),
-                "topic": item.get("topic"),
-                "timestamp": item.get("timestamp"),
-                "payload_hex": item.get("payload_hex"),
-            }
-
-            decrypted = item.get("payload_decrypted", {})
-            if isinstance(decrypted, dict):
-                row.update(decrypted)
-            else:
-                row["decrypted_value"] = decrypted
-
-            rows.append(row)
-
-    if not rows:
+    if df.empty:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
+    df["device_name"] = df["device_id"].map(DEVICE_NAME_MAP).fillna("Unknown device")
+
+    # Expand JSONB payload_decrypted into normal columns
+    payload_expanded = pd.json_normalize(df["payload_decrypted"])
+    df = pd.concat([df.drop(columns=["payload_decrypted"]), payload_expanded], axis=1)
 
     df["timestamp"] = (
         pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
@@ -147,6 +142,12 @@ def load_device_file_cached(file_path_str: str, file_mtime: float) -> pd.DataFra
     for col in ["latitude", "longitude"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Try to coerce other numeric fields too
+    excluded = {"device_id", "device_name", "topic", "timestamp", "payload_hex", "raw_hex"}
+    for col in df.columns:
+        if col not in excluded:
+            df[col] = pd.to_numeric(df[col], errors="ignore")
 
     return df
 
@@ -187,11 +188,7 @@ def get_last_position(df: pd.DataFrame):
     return float(last_row["latitude"]), float(last_row["longitude"])
 
 
-def build_status_row(file_path_str: str, file_mtime: float, cache: dict, now: pd.Timestamp):
-    file_path = Path(file_path_str)
-    df = load_device_file_cached(file_path_str, file_mtime)
-
-    device_id = file_path.stem
+def build_status_row(device_id: str, df: pd.DataFrame, cache: dict, now: pd.Timestamp):
     device_name = DEVICE_NAME_MAP.get(device_id, "Unknown device")
     cached_entry = cache.get(device_id, {})
 
@@ -244,14 +241,14 @@ def build_status_row(file_path_str: str, file_mtime: float, cache: dict, now: pd
     }
 
 
-def get_device_status_table(files):
+def get_device_status_table(all_df: pd.DataFrame):
     now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
     cache = load_status_cache()
 
-    rows = [
-        build_status_row(str(file_path), file_path.stat().st_mtime, cache, now)
-        for file_path in files
-    ]
+    rows = []
+    for device_id, device_df in all_df.groupby("device_id"):
+        rows.append(build_status_row(device_id, device_df, cache, now))
+
     return pd.DataFrame(rows)
 
 
@@ -352,6 +349,8 @@ def render_device_cards(status_table: pd.DataFrame):
         st.info("No devices found.")
         return
 
+    status_table = status_table.sort_values(["status", "device_name"])
+
     cols_per_row = 4
     rows = [status_table.iloc[i:i + cols_per_row] for i in range(0, len(status_table), cols_per_row)]
 
@@ -410,17 +409,11 @@ def render_device_cards(status_table: pd.DataFrame):
                     st.rerun()
 
 
-def render_device_details(selected_device_id: str, files, status_table: pd.DataFrame):
-    selected_file = next((f for f in files if f.stem == selected_device_id), None)
-
-    if selected_file is None:
-        st.error("Selected device file not found.")
-        return
-
-    df = load_device_file_cached(str(selected_file), selected_file.stat().st_mtime)
+def render_device_details(selected_device_id: str, all_df: pd.DataFrame, status_table: pd.DataFrame):
+    df = all_df[all_df["device_id"] == selected_device_id].copy()
 
     if df.empty:
-        st.warning("Selected device file is empty.")
+        st.warning("No data found for selected device.")
         return
 
     selected_status_row = status_table[status_table["device_id"] == selected_device_id]
@@ -461,7 +454,7 @@ def render_device_details(selected_device_id: str, files, status_table: pd.DataF
     with st.expander("Show reports list", expanded=False):
         st.dataframe(df, width="stretch")
 
-    excluded = {"device_id", "device_name", "topic", "timestamp", "payload_hex"}
+    excluded = {"device_id", "device_name", "topic", "timestamp", "payload_hex", "raw_hex"}
     numeric_columns = [
         c for c in df.columns
         if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
@@ -550,22 +543,23 @@ def main():
 
     st.title("IoT Sensor Viewer")
 
-    if not DATA_DIR.exists():
-        st.warning("No data folder found.")
+    try:
+        all_df = load_all_records_cached()
+    except Exception as e:
+        st.error(f"Failed to load data from database: {e}")
         return
 
-    files = sorted(DATA_DIR.glob("*.jsonl"))
-    if not files:
-        st.warning("No device files found in data/.")
+    if all_df.empty:
+        st.warning("No data found in mqtt_records.")
         return
 
-    status_table = get_device_status_table(files)
+    status_table = get_device_status_table(all_df)
     notify_warning_to_offline(status_table)
 
     selected_device_id = st.session_state["selected_device_id"]
 
     if selected_device_id:
-        render_device_details(selected_device_id, files, status_table)
+        render_device_details(selected_device_id, all_df, status_table)
         return
 
     online_count = int((status_table["status"] == "online").sum())
